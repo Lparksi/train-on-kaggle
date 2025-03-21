@@ -180,7 +180,6 @@ def train(rank, world_size):
 def main():
     world_size = torch.cuda.device_count()
     if world_size > 1:
-        # 在 Kaggle 中使用 !python 运行需要将 mp.spawn 改为 subprocess 或直接运行
         mp.spawn(train, args=(world_size,), nprocs=world_size, join=True)
     else:
         train(0, 1)

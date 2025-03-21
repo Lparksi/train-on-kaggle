@@ -53,7 +53,7 @@ def train(rank, world_size):
 
     # 数据加载
     train_dataset = datasets.ImageFolder(
-        root=os.path.join(Config.data_root, "train"),
+        root=os.path.join(Config.dataset["root"], Config.dataset["train_dir"]),
         transform=get_transform("train")
     )
     
@@ -73,7 +73,7 @@ def train(rank, world_size):
 
     if rank == 0:
         validate_dataset = datasets.ImageFolder(
-            root=os.path.join(Config.data_root, "val"),
+            root=os.path.join(Config.dataset["root"], Config.dataset["val_dir"]),
             transform=get_transform("val")
         )
         validate_loader = torch.utils.data.DataLoader(
@@ -95,7 +95,7 @@ def train(rank, world_size):
     state_dict = torch.load(Config.pretrained_path, map_location='cpu')
     model.load_state_dict(state_dict, strict=False)
     in_channel = model.fc.in_features
-    model.fc = nn.Linear(in_channel, Config.num_classes)
+    model.fc = nn.Linear(in_channel, Config.dataset["num_classes"])
     
     model = model.to(device)
     model = DDP(model, device_ids=[rank])

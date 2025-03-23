@@ -27,13 +27,12 @@ def get_transform(phase):
     cfg = Config.data_transform[phase]
     transforms_list = []
     
-    # 确保转换为单通道灰度图
     if "Grayscale" in cfg:
         transforms_list.append(transforms.Grayscale(num_output_channels=cfg["Grayscale"]))
     else:
         raise ValueError(f"Phase {phase} missing Grayscale configuration!")
     
-    if phase == "train":  # 训练阶段添加数据增强
+    if phase == "train":
         transforms_list.extend([
             transforms.RandomResizedCrop(cfg.get("RandomResizedCrop", 64)),
             transforms.RandomHorizontalFlip(p=0.5 if cfg.get("RandomHorizontalFlip", False) else 0),
@@ -41,7 +40,7 @@ def get_transform(phase):
             transforms.ColorJitter(**cfg.get("ColorJitter", {"brightness": 0.2, "contrast": 0.2, "saturation": 0.2})),
             transforms.RandomErasing(**cfg.get("RandomErasing", {"p": 0.5, "scale": (0.02, 0.33)})),
         ])
-    else:  # 验证阶段简单处理
+    else:
         transforms_list.extend([
             transforms.Resize(cfg.get("Resize", 80)),
             transforms.CenterCrop(cfg.get("CenterCrop", 64)),
@@ -95,17 +94,18 @@ def train(rank, world_size):
         print(f"Number of classes: {len(train_dataset.class_to_idx)}")
         print(f"Training samples: {len(train_dataset)}")
         print(f"Validation samples: {len(validate_dataset)}")
+        print(f"Early stopping patience: {Config.early_stopping_patience}")  # 显示早停耐心值
 
         cla_dict = dict((val, key) for key, val in train_dataset.class_to_idx.items())
         with open('class_indices.json', 'w') as json_file:
             json_file.write(json.dumps(cla_dict, indent=4))
 
-    # 加载预训练的 ResNet50 模型
+    # 加载预训练的 ResNet50 模型，自动下载
     model = resnet50(pretrained=True)
-    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)  # 适配单通道灰度图
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     in_channel = model.fc.in_features
     model.fc = nn.Sequential(
-        nn.Dropout(p=0.5),  # 正则化：Dropout
+        nn.Dropout(p=0.5),
         nn.Linear(in_channel, Config.dataset["num_classes"])
     )
     
@@ -114,7 +114,7 @@ def train(rank, world_size):
 
     # 损失函数和优化器
     loss_function = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=Config.lr, weight_decay=1e-4)  # 正则化：权重衰减
+    optimizer = optim.Adam(model.parameters(), lr=Config.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda')
 
     # 检查点加载
@@ -130,8 +130,8 @@ def train(rank, world_size):
         if rank == 0:
             print(f"Resuming from epoch {start_epoch}, best accuracy: {best_acc:.3f}")
 
-    # 训练循环，应用早停
-    patience = 10  # 早停耐心值
+    # 训练循环，使用 Config 中的早停参数
+    patience = Config.early_stopping_patience  # 从 Config 读取耐心值
     no_improve = 0
     for epoch in range(start_epoch, Config.epochs):
         model.train()
@@ -142,8 +142,6 @@ def train(rank, world_size):
         for data in train_bar:
             images, labels = data
             images, labels = images.to(device), labels.to(device)
-            
-            # 调试：检查输入是否为单通道灰度图
             if rank == 0 and epoch == start_epoch and train_bar.n == 0:
                 print(f"Input image shape: {images.shape}, channels: {images.shape[1]}")
                 assert images.shape[1] == 1, "Input is not a single-channel grayscale image!"

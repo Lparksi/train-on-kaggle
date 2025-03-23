@@ -7,11 +7,17 @@ import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torchvision import transforms, datasets
+from torchvision import transforms, datasets, models
 from tqdm import tqdm
 import json
-from torchvision.models import resnext101_32x8d
+import matplotlib.pyplot as plt  # 添加绘图支持
 from config import Config
+
+# 用于记录训练过程中的参数
+history = {
+    'train_loss': [],
+    'val_accuracy': []
+}
 
 def setup(rank, world_size):
     """初始化分布式环境"""
@@ -43,13 +49,40 @@ def get_transform(phase):
     
     return transforms.Compose(transforms_list)
 
+def plot_metrics(history, save_dir='./plots'):
+    """绘制训练过程中的参数变化并保存"""
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    
+    # 绘制训练损失
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['train_loss'], label='Training Loss')
+    plt.title('Training Loss Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'train_loss.png'))
+    plt.close()
+    
+    # 绘制验证准确率
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Validation Accuracy Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'val_accuracy.png'))
+    plt.close()
+
 def train(rank, world_size):
     """训练函数"""
     setup(rank, world_size)
     
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     if rank == 0:
-        print(f"Using {world_size} GPUs for training.")
+        print(f"使用 {world_size} 个GPU进行训练。")
 
     # 数据加载
     train_dataset = datasets.ImageFolder(
@@ -82,18 +115,16 @@ def train(rank, world_size):
             shuffle=False,
             num_workers=nw
         )
-        print(f"Number of classes: {len(train_dataset.class_to_idx)}")
-        print(f"Training samples: {len(train_dataset)}")
-        print(f"Validation samples: {len(validate_dataset)}")
+        print(f"类别数量: {len(train_dataset.class_to_idx)}")
+        print(f"训练样本数: {len(train_dataset)}")
+        print(f"验证样本数: {len(validate_dataset)}")
 
         cla_dict = dict((val, key) for key, val in train_dataset.class_to_idx.items())
         with open('class_indices.json', 'w') as json_file:
             json_file.write(json.dumps(cla_dict, indent=4))
 
-    # 模型加载
-    model = resnext101_32x8d(pretrained=False)
-    state_dict = torch.load(Config.pretrained_path, map_location='cpu')
-    model.load_state_dict(state_dict, strict=False)
+    # 模型加载 - 修改为自动下载预训练权重
+    model = models.resnext101_32x8d(weights=models.ResNeXt101_32X8D_Weights.IMAGENET1K_V1)  # 自动下载
     in_channel = model.fc.in_features
     model.fc = nn.Linear(in_channel, Config.dataset["num_classes"])
     
@@ -116,7 +147,7 @@ def train(rank, world_size):
         start_epoch = checkpoint['epoch'] + 1
         best_acc = checkpoint['best_acc']
         if rank == 0:
-            print(f"Resuming from epoch {start_epoch}, best accuracy: {best_acc:.3f}")
+            print(f"从第 {start_epoch} 个epoch继续训练，最佳准确率: {best_acc:.3f}")
 
     # 训练循环
     for epoch in range(start_epoch, Config.epochs):
@@ -139,7 +170,7 @@ def train(rank, world_size):
             scaler.update()
 
             running_loss += loss.item()
-            train_bar.desc = f"train epoch[{epoch+1}/{Config.epochs}] loss:{loss:.3f}"
+            train_bar.desc = f"训练 epoch[{epoch+1}/{Config.epochs}] 损失:{loss:.3f}"
 
         dist.barrier()
 
@@ -155,11 +186,15 @@ def train(rank, world_size):
                         outputs = model(val_images)
                     predict_y = torch.max(outputs, dim=1)[1]
                     acc += torch.eq(predict_y, val_labels).sum().item()
-                    val_bar.desc = f"valid epoch[{epoch+1}/{Config.epochs}]"
+                    val_bar.desc = f"验证 epoch[{epoch+1}/{Config.epochs}]"
 
             val_accurate = acc / len(validate_dataset)
             train_loss = running_loss / len(train_loader)
-            print(f'[epoch {epoch+1}] train_loss: {train_loss:.3f} val_accuracy: {val_accurate:.3f}')
+            print(f'[epoch {epoch+1}] 训练损失: {train_loss:.3f} 验证准确率: {val_accurate:.3f}')
+
+            # 记录训练过程中的参数
+            history['train_loss'].append(train_loss)
+            history['val_accuracy'].append(val_accurate)
 
             if val_accurate > best_acc:
                 best_acc = val_accurate
@@ -171,10 +206,15 @@ def train(rank, world_size):
                     'best_acc': best_acc
                 }
                 torch.save(checkpoint, Config.save_path)
-                print(f"New best accuracy: {best_acc:.3f}, model saved.")
+                print(f"新的最佳准确率: {best_acc:.3f}，模型已保存。")
+
+            # 每个epoch后绘制并保存图表
+            plot_metrics(history)
 
     if rank == 0:
-        print('Finished Training')
+        print('训练完成')
+        # 训练结束后保存最终图表
+        plot_metrics(history)
     cleanup()
 
 def main():

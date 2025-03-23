@@ -1,6 +1,7 @@
 # train.py
 import os
 import sys
+import time  # 添加时间模块
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,7 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms, datasets, models
 from tqdm import tqdm
 import json
-import matplotlib.pyplot as plt  # 添加绘图支持
+import matplotlib.pyplot as plt
 from config import Config
 
 # 用于记录训练过程中的参数
@@ -54,7 +55,6 @@ def plot_metrics(history, save_dir='./plots'):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
-    # 绘制训练损失
     plt.figure(figsize=(10, 6))
     plt.plot(history['train_loss'], label='Training Loss')
     plt.title('Training Loss Over Time')
@@ -65,7 +65,6 @@ def plot_metrics(history, save_dir='./plots'):
     plt.savefig(os.path.join(save_dir, 'train_loss.png'))
     plt.close()
     
-    # 绘制验证准确率
     plt.figure(figsize=(10, 6))
     plt.plot(history['val_accuracy'], label='Validation Accuracy')
     plt.title('Validation Accuracy Over Time')
@@ -123,8 +122,8 @@ def train(rank, world_size):
         with open('class_indices.json', 'w') as json_file:
             json_file.write(json.dumps(cla_dict, indent=4))
 
-    # 模型加载 - 修改为自动下载预训练权重
-    model = models.resnext101_32x8d(weights=models.ResNeXt101_32X8D_Weights.IMAGENET1K_V1)  # 自动下载
+    # 模型加载 - 自动下载预训练权重
+    model = models.resnext101_32x8d(weights=models.ResNeXt101_32X8D_Weights.IMAGENET1K_V1)
     in_channel = model.fc.in_features
     model.fc = nn.Linear(in_channel, Config.dataset["num_classes"])
     
@@ -148,6 +147,10 @@ def train(rank, world_size):
         best_acc = checkpoint['best_acc']
         if rank == 0:
             print(f"从第 {start_epoch} 个epoch继续训练，最佳准确率: {best_acc:.3f}")
+
+    # 训练开始计时
+    start_time = time.time()
+    max_duration = 5 * 3600  # 5小时转换为秒
 
     # 训练循环
     for epoch in range(start_epoch, Config.epochs):
@@ -208,12 +211,20 @@ def train(rank, world_size):
                 torch.save(checkpoint, Config.save_path)
                 print(f"新的最佳准确率: {best_acc:.3f}，模型已保存。")
 
-            # 每个epoch后绘制并保存图表
+            # 绘制图表
             plot_metrics(history)
+
+            # 检查训练时间
+            elapsed_time = time.time() - start_time
+            if elapsed_time > max_duration:
+                print(f"训练时间超过5小时（已用时 {elapsed_time/3600:.2f} 小时），退出训练。")
+                print(f"当前最佳准确率: {best_acc:.3f}，已保存至 {Config.save_path}")
+                plot_metrics(history)  # 保存最终图表
+                cleanup()
+                return  # 退出训练
 
     if rank == 0:
         print('训练完成')
-        # 训练结束后保存最终图表
         plot_metrics(history)
     cleanup()
 

@@ -7,9 +7,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms, datasets
+from torchvision.models import resnet50, ResNet50_Weights  # 导入权重枚举
 from tqdm import tqdm
 import json
-from torchvision.models import resnet50
 from config import Config
 
 def setup(rank, world_size):
@@ -29,8 +29,9 @@ def get_transform(phase):
     
     if "Grayscale" in cfg:
         transforms_list.append(transforms.Grayscale(num_output_channels=cfg["Grayscale"]))
-    else:
-        raise ValueError(f"Phase {phase} missing Grayscale configuration!")
+    
+    # 先转换为张量，避免 PIL Image 相关错误
+    transforms_list.append(transforms.ToTensor())
     
     if phase == "train":
         transforms_list.extend([
@@ -46,7 +47,6 @@ def get_transform(phase):
             transforms.CenterCrop(cfg.get("CenterCrop", 64)),
         ])
     
-    transforms_list.append(transforms.ToTensor())
     transforms_list.append(transforms.Normalize(mean=cfg["Normalize"]["mean"], 
                                               std=cfg["Normalize"]["std"]))
     
@@ -94,14 +94,14 @@ def train(rank, world_size):
         print(f"Number of classes: {len(train_dataset.class_to_idx)}")
         print(f"Training samples: {len(train_dataset)}")
         print(f"Validation samples: {len(validate_dataset)}")
-        print(f"Early stopping patience: {Config.early_stopping_patience}")  # 显示早停耐心值
+        print(f"Early stopping patience: {Config.early_stopping_patience}")
 
         cla_dict = dict((val, key) for key, val in train_dataset.class_to_idx.items())
         with open('class_indices.json', 'w') as json_file:
             json_file.write(json.dumps(cla_dict, indent=4))
 
-    # 加载预训练的 ResNet50 模型，自动下载
-    model = resnet50(pretrained=True)
+    # 加载预训练的 ResNet50 模型，使用最新权重枚举
+    model = resnet50(weights=ResNet50_Weights.DEFAULT)  # 自动下载最新权重
     model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     in_channel = model.fc.in_features
     model.fc = nn.Sequential(
@@ -130,8 +130,8 @@ def train(rank, world_size):
         if rank == 0:
             print(f"Resuming from epoch {start_epoch}, best accuracy: {best_acc:.3f}")
 
-    # 训练循环，使用 Config 中的早停参数
-    patience = Config.early_stopping_patience  # 从 Config 读取耐心值
+    # 训练循环
+    patience = Config.early_stopping_patience
     no_improve = 0
     for epoch in range(start_epoch, Config.epochs):
         model.train()

@@ -12,66 +12,61 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from config import Config
 from torchvision.models import resnext101_32x8d
+import matplotlib.pyplot as plt
+import numpy as np
 
-# 自定义二值化变换类
-class Binarize(object):
-    """将灰度图像二值化为黑白图像"""
-    def __init__(self, threshold=0.5):
-        self.threshold = threshold
+# ... (Binarize类和get_transform函数保持不变) ...
 
-    def __call__(self, img):
-        # 先将 PIL Image 转换为张量
-        img = transforms.functional.to_tensor(img)
-        # 转换为灰度（单通道）
-        img = transforms.functional.rgb_to_grayscale(img, num_output_channels=1)
-        # 二值化
-        img = torch.where(img > self.threshold, torch.ones_like(img), torch.zeros_like(img))
-        return img
+# 用于存储训练数据的类
+class TrainingStats:
+    def __init__(self):
+        self.train_losses = []
+        self.val_accuracies = []
+        self.best_acc = 0.0
 
-# 数据变换函数
-def get_transform(phase):
-    """根据训练或验证阶段生成数据变换"""
-    cfg = Config.data_transform[phase]
-    transforms_list = []
-    
-    if phase == "train":
-        if "RandomResizedCrop" in cfg:
-            transforms_list.append(transforms.RandomResizedCrop(cfg["RandomResizedCrop"]))
-        if "RandomHorizontalFlip" in cfg and cfg["RandomHorizontalFlip"]:
-            transforms_list.append(transforms.RandomHorizontalFlip())
-    else:  # val
-        if "Resize" in cfg:
-            transforms_list.append(transforms.Resize(cfg["Resize"]))
-        if "CenterCrop" in cfg:
-            transforms_list.append(transforms.CenterCrop(cfg["CenterCrop"]))
-    
-    transforms_list.append(Binarize(threshold=cfg["BinarizeThreshold"]))  # 灰度 + 二值化
-    transforms_list.append(transforms.Normalize(mean=cfg["Normalize"]["mean"], 
-                                               std=cfg["Normalize"]["std"]))
-    
-    return transforms.Compose(transforms_list)
+    def update(self, train_loss, val_accuracy):
+        self.train_losses.append(train_loss)
+        self.val_accuracies.append(val_accuracy)
+        self.best_acc = max(self.best_acc, val_accuracy)
 
-# 初始化分布式环境
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    def plot_and_save(self, save_dir="training_plots"):
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 绘制训练损失曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_losses, label='Training Loss')
+        plt.title('Training Loss Over Time')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(save_dir, 'train_loss.png'))
+        plt.close()
 
-# 清理分布式环境
-def cleanup():
-    dist.destroy_process_group()
+        # 绘制验证准确率曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.val_accuracies, label='Validation Accuracy')
+        plt.plot([self.best_acc] * len(self.val_accuracies), 
+                label='Best Accuracy', linestyle='--')
+        plt.title('Validation Accuracy Over Time')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(save_dir, 'val_accuracy.png'))
+        plt.close()
 
-# 训练函数
+# 修改训练函数
 def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.max_epochs, 
           patience=Config.patience, min_delta=Config.min_delta):
-    # 初始化分布式训练
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
+    stats = TrainingStats() if rank == 0 else None
+    
     if rank == 0:
-        print(f"Using {world_size} GPUs for training.")
+        print(f"使用 {world_size} 个GPU进行训练")
 
-    # 数据加载
+    # 数据加载部分保持不变
     train_dataset = datasets.ImageFolder(
         root=Config.dataset["train_root"],
         transform=get_transform("train")
@@ -90,7 +85,6 @@ def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.ma
         pin_memory=True
     )
 
-    # 仅 rank 0 加载验证集
     if rank == 0:
         val_dataset = datasets.ImageFolder(
             root=Config.dataset["val_root"],
@@ -103,24 +97,21 @@ def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.ma
             num_workers=min(os.cpu_count(), 4),
             pin_memory=True
         )
-        print(f"Number of classes: {len(train_dataset.classes)}")
-        print(f"Training samples: {len(train_dataset)}")
-        print(f"Validation samples: {len(val_dataset)}")
-    else:
-        val_loader = None
+        print(f"类别数: {len(train_dataset.classes)}")
+        print(f"训练样本数: {len(train_dataset)}")
+        print(f"验证样本数: {len(val_dataset)}")
 
-    # 模型加载
-    model = resnext101_32x8d(weights=None)  # 替换 pretrained=False 为 weights=None
+    # 使用不带预训练权重的模型
+    model = resnext101_32x8d(weights=None)  # 不加载预训练权重
     model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     model.fc = nn.Linear(model.fc.in_features, Config.dataset["num_classes"])
     model = model.to(device)
     model = DDP(model, device_ids=[rank])
 
-    # 损失函数和优化器
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=Config.lr)
 
-    # 继续训练：加载检查点
+    # 检查点加载逻辑保持不变
     start_epoch = 0
     best_acc = 0.0
     if resume_path and os.path.exists(resume_path) and rank == 0:
@@ -129,9 +120,10 @@ def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.ma
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_acc = checkpoint.get('best_acc', 0.0)
-        print(f"Resuming from epoch {start_epoch}, best accuracy: {best_acc:.3f}")
+        if rank == 0:
+            stats.best_acc = best_acc
+        print(f"从epoch {start_epoch}继续训练，最佳准确率: {best_acc:.3f}")
 
-    # 广播检查点参数
     dist.barrier()
     if resume_path and os.path.exists(resume_path):
         broadcast_dict = {
@@ -145,7 +137,6 @@ def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.ma
         start_epoch = int(broadcast_dict['start_epoch'])
         best_acc = broadcast_dict['best_acc']
 
-    # 早停参数
     patience_counter = 0
     best_model_path = Config.save_path
 
@@ -165,9 +156,8 @@ def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.ma
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-            train_bar.desc = f"train epoch[{epoch+1}/{max_epochs}] loss:{loss:.3f}"
+            train_bar.desc = f"训练 epoch[{epoch+1}/{max_epochs}] 损失:{loss:.3f}"
 
-        # 同步损失
         loss_tensor = torch.tensor(running_loss).to(device)
         dist.reduce(loss_tensor, dst=0)
         if rank == 0:
@@ -188,17 +178,17 @@ def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.ma
                     outputs = model(val_images)
                     predict_y = torch.max(outputs, dim=1)[1]
                     acc += torch.eq(predict_y, val_labels).sum().item()
-                    val_bar.desc = f"valid epoch[{epoch+1}/{max_epochs}]"
+                    val_bar.desc = f"验证 epoch[{epoch+1}/{max_epochs}]"
             val_accuracy = acc / len(val_dataset)
+            # 更新统计数据
+            stats.update(avg_train_loss, val_accuracy)
 
-        # 广播验证准确率
         val_acc_tensor = torch.tensor(val_accuracy).to(device)
         dist.broadcast(val_acc_tensor, src=0)
         val_accuracy = val_acc_tensor.item()
 
-        # 仅 rank 0 打印和保存
         if rank == 0:
-            print(f"[epoch {epoch+1}] train_loss: {avg_train_loss:.3f} val_accuracy: {val_accuracy:.3f}")
+            print(f"[epoch {epoch+1}] 训练损失: {avg_train_loss:.3f} 验证准确率: {val_accuracy:.3f}")
             if val_accuracy > best_acc + min_delta:
                 best_acc = val_accuracy
                 patience_counter = 0
@@ -209,29 +199,27 @@ def train(rank, world_size, resume_path=Config.resume_path, max_epochs=Config.ma
                     'best_acc': best_acc
                 }
                 torch.save(checkpoint, best_model_path)
-                print(f"New best accuracy: {best_acc:.3f}, model saved to {best_model_path}")
+                print(f"新的最佳准确率: {best_acc:.3f}, 模型已保存至 {best_model_path}")
             else:
                 patience_counter += 1
-                print(f"No improvement. Patience counter: {patience_counter}/{patience}")
+                print(f"无改进。耐心计数: {patience_counter}/{patience}")
 
-        # 广播耐心计数器
         patience_tensor = torch.tensor(patience_counter).to(device)
         dist.broadcast(patience_tensor, src=0)
         patience_counter = int(patience_tensor.item())
 
-        # 早停检查
         if patience_counter >= patience:
             if rank == 0:
-                print(f"Early stopping triggered after {epoch+1} epochs.")
+                print(f"在 {epoch+1} 个epoch后触发早停")
             break
 
         dist.barrier()
 
     if rank == 0:
-        print("Finished Training")
+        print("训练完成")
+        stats.plot_and_save()  # 保存训练过程中的图像
     cleanup()
 
-# 主函数
 def main():
     world_size = torch.cuda.device_count()
     if world_size > 1:
@@ -240,6 +228,4 @@ def main():
         train(rank=0, world_size=1)
 
 if __name__ == "__main__":
-    # os.environ['RESUME_PATH'] = '/kaggle/input/checkpoint/best_model.pth'
-
     main()

@@ -1,3 +1,4 @@
+# train.py
 import os
 import sys
 import torch
@@ -9,7 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms, datasets
 from tqdm import tqdm
 import json
-from torchvision.models import resnet50  # 修改为resnet50
+from torchvision.models import resnet50  # 使用 resnet50
 from config import Config
 
 def setup(rank, world_size):
@@ -27,7 +28,6 @@ def get_transform(phase):
     cfg = Config.data_transform[phase]
     transforms_list = []
     
-    # 添加灰度转换
     if "Grayscale" in cfg:
         transforms_list.append(transforms.Grayscale(num_output_channels=cfg["Grayscale"]))
     
@@ -54,7 +54,7 @@ def train(rank, world_size):
     if rank == 0:
         print(f"Using {world_size} GPUs for training.")
 
-    # 数据加载部分保持不变
+    # 数据加载
     train_dataset = datasets.ImageFolder(
         root=os.path.join(Config.dataset["root"], Config.dataset["train_dir"]),
         transform=get_transform("train")
@@ -93,23 +93,23 @@ def train(rank, world_size):
         with open('class_indices.json', 'w') as json_file:
             json_file.write(json.dumps(cla_dict, indent=4))
 
-    # 修改模型为resnet50，并调整输入通道
-    model = resnet50(pretrained=False)
-    state_dict = torch.load(Config.pretrained_path, map_location='cpu')
-    model.load_state_dict(state_dict, strict=False)
-    # 修改第一层卷积以接受单通道输入
+    # 自动加载预训练的 ResNet50 模型
+    model = resnet50(pretrained=True)  # 直接使用 pretrained=True 自动下载
+    # 修改第一层卷积以接受单通道灰度图输入
     model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    # 修改全连接层以匹配分类数
     in_channel = model.fc.in_features
     model.fc = nn.Linear(in_channel, Config.dataset["num_classes"])
     
     model = model.to(device)
     model = DDP(model, device_ids=[rank])
 
-    # 以下训练循环部分保持不变
+    # 损失函数和优化器
     loss_function = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=Config.lr)
     scaler = torch.amp.GradScaler('cuda')
 
+    # 检查点加载（如果有）
     start_epoch = 0
     best_acc = 0.0
     if Config.resume:
@@ -122,6 +122,7 @@ def train(rank, world_size):
         if rank == 0:
             print(f"Resuming from epoch {start_epoch}, best accuracy: {best_acc:.3f}")
 
+    # 训练循环
     for epoch in range(start_epoch, Config.epochs):
         model.train()
         train_sampler.set_epoch(epoch)

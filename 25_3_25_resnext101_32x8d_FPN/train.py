@@ -24,13 +24,20 @@ history = {
 
 def setup(rank, world_size):
     """初始化分布式环境"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    master_addr = os.getenv('MASTER_ADDR', '127.0.0.1')  # 默认使用 127.0.0.1
+    master_port = os.getenv('MASTER_PORT', '29500')      # 默认端口
+    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_PORT'] = master_port
+    try:
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    except RuntimeError as e:
+        print(f"分布式初始化失败: {e}")
+        raise
 
 def cleanup():
     """清理分布式环境"""
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def get_transform(phase):
     """根据配置生成数据变换"""
@@ -101,9 +108,11 @@ class ResNeXtWithFPN(nn.Module):
             out_channels=256  # FPN 统一输出通道数
         )
         
-        # 全局池化和分类层
+        # 全局池化
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(256, num_classes)  # FPN 输出通道数为 256
+        
+        # 融合多层特征的全连接层
+        self.fc = nn.Linear(256 * 4, num_classes)  # 融合 4 层特征，每层 256 通道
         
     def forward(self, x):
         # 提取多层特征
@@ -112,15 +121,18 @@ class ResNeXtWithFPN(nn.Module):
         # 将特征送入 FPN
         fpn_features = self.fpn(features)
         
-        # 取顶层特征进行分类
-        top_feature = fpn_features['layer4']
+        # 融合所有层的特征
+        pooled_features = []
+        for layer_name in ['layer1', 'layer2', 'layer3', 'layer4']:
+            pooled = self.pool(fpn_features[layer_name])
+            pooled = pooled.view(pooled.size(0), -1)
+            pooled_features.append(pooled)
         
-        # 全局平均池化
-        x = self.pool(top_feature)
+        # 拼接所有特征
+        combined_features = torch.cat(pooled_features, dim=1)  # [batch_size, 256*4]
         
-        # 展平并送入分类器
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
+        # 分类
+        x = self.fc(combined_features)
         return x
 
 def train(rank, world_size):
@@ -173,7 +185,7 @@ def train(rank, world_size):
     # 模型加载
     model = ResNeXtWithFPN(num_classes=Config.dataset["num_classes"])
     model = model.to(device)
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)  # 启用未使用参数检测
 
     # 损失函数和优化器
     loss_function = nn.CrossEntropyLoss()
@@ -183,100 +195,111 @@ def train(rank, world_size):
     # 检查点加载
     start_epoch = 0
     best_acc = 0.0
-    if Config.resume:
-        checkpoint = torch.load(Config.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_acc = checkpoint['best_acc']
-        if rank == 0:
-            print(f"从第 {start_epoch} 个epoch继续训练，最佳准确率: {best_acc:.3f}")
+    if Config.resume and os.path.exists(Config.resume):
+        try:
+            checkpoint = torch.load(Config.resume, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_acc = checkpoint['best_acc']
+            if rank == 0:
+                print(f"从第 {start_epoch} 个epoch继续训练，最佳准确率: {best_acc:.3f}")
+        except Exception as e:
+            if rank == 0:
+                print(f"加载检查点失败: {e}，从头开始训练")
+    elif Config.resume and rank == 0:
+        print(f"检查点文件 {Config.resume} 不存在，从头开始训练")
 
     # 训练开始计时
     start_time = time.time()
     max_duration = 5 * 3600  # 5小时转换为秒
 
     # 训练循环
-    for epoch in range(start_epoch, Config.epochs):
-        model.train()
-        train_sampler.set_epoch(epoch)
-        running_loss = 0.0
-        train_bar = tqdm(train_loader, file=sys.stdout, disable=rank != 0)
-        
-        for data in train_bar:
-            images, labels = data
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
+    try:
+        for epoch in range(start_epoch, Config.epochs):
+            model.train()
+            train_sampler.set_epoch(epoch)
+            running_loss = 0.0
+            train_bar = tqdm(train_loader, file=sys.stdout, disable=rank != 0)
+            
+            for data in train_bar:
+                images, labels = data
+                images, labels = images.to(device), labels.to(device)
+                optimizer.zero_grad()
 
-            with torch.amp.autocast('cuda'):
-                outputs = model(images)
-                loss = loss_function(outputs, labels)
+                with torch.amp.autocast('cuda'):
+                    outputs = model(images)
+                    loss = loss_function(outputs, labels)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-            running_loss += loss.item()
-            train_bar.desc = f"训练 epoch[{epoch+1}/{Config.epochs}] 损失:{loss:.3f}"
+                running_loss += loss.item()
+                train_bar.desc = f"训练 epoch[{epoch+1}/{Config.epochs}] 损失:{loss:.3f}"
 
-        dist.barrier()
+            dist.barrier()
+
+            if rank == 0:
+                model.eval()
+                acc = 0.0
+                with torch.no_grad():
+                    val_bar = tqdm(validate_loader, file=sys.stdout)
+                    for val_data in val_bar:
+                        val_images, val_labels = val_data
+                        val_images, val_labels = val_images.to(device), val_labels.to(device)
+                        with torch.amp.autocast('cuda'):
+                            outputs = model(val_images)
+                        predict_y = torch.max(outputs, dim=1)[1]
+                        acc += torch.eq(predict_y, val_labels).sum().item()
+                        val_bar.desc = f"验证 epoch[{epoch+1}/{Config.epochs}]"
+
+                val_accurate = acc / len(validate_dataset)
+                train_loss = running_loss / len(train_loader)
+                print(f'[epoch {epoch+1}] 训练损失: {train_loss:.3f} 验证准确率: {val_accurate:.3f}')
+
+                # 记录训练过程中的参数
+                history['train_loss'].append(train_loss)
+                history['val_accuracy'].append(val_accurate)
+
+                if val_accurate > best_acc:
+                    best_acc = val_accurate
+                    checkpoint = {
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
+                        'epoch': epoch,
+                        'best_acc': best_acc
+                    }
+                    torch.save(checkpoint, Config.save_path)
+                    print(f"新的最佳准确率: {best_acc:.3f}，模型已保存。")
+
+                # 绘制图表
+                plot_metrics(history)
+
+                # 检查训练时间
+                elapsed_time = time.time() - start_time
+                if elapsed_time > max_duration:
+                    print(f"训练时间超过5小时（已用时 {elapsed_time/3600:.2f} 小时），退出训练。")
+                    print(f"当前最佳准确率: {best_acc:.3f}，已保存至 {Config.save_path}")
+                    plot_metrics(history)  # 保存最终图表
+                    return  # 退出训练
 
         if rank == 0:
-            model.eval()
-            acc = 0.0
-            with torch.no_grad():
-                val_bar = tqdm(validate_loader, file=sys.stdout)
-                for val_data in val_bar:
-                    val_images, val_labels = val_data
-                    val_images, val_labels = val_images.to(device), val_labels.to(device)
-                    with torch.amp.autocast('cuda'):
-                        outputs = model(val_images)
-                    predict_y = torch.max(outputs, dim=1)[1]
-                    acc += torch.eq(predict_y, val_labels).sum().item()
-                    val_bar.desc = f"验证 epoch[{epoch+1}/{Config.epochs}]"
-
-            val_accurate = acc / len(validate_dataset)
-            train_loss = running_loss / len(train_loader)
-            print(f'[epoch {epoch+1}] 训练损失: {train_loss:.3f} 验证准确率: {val_accurate:.3f}')
-
-            # 记录训练过程中的参数
-            history['train_loss'].append(train_loss)
-            history['val_accuracy'].append(val_accurate)
-
-            if val_accurate > best_acc:
-                best_acc = val_accurate
-                checkpoint = {
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                    'epoch': epoch,
-                    'best_acc': best_acc
-                }
-                torch.save(checkpoint, Config.save_path)
-                print(f"新的最佳准确率: {best_acc:.3f}，模型已保存。")
-
-            # 绘制图表
+            print('训练完成')
             plot_metrics(history)
-
-            # 检查训练时间
-            elapsed_time = time.time() - start_time
-            if elapsed_time > max_duration:
-                print(f"训练时间超过5小时（已用时 {elapsed_time/3600:.2f} 小时），退出训练。")
-                print(f"当前最佳准确率: {best_acc:.3f}，已保存至 {Config.save_path}")
-                plot_metrics(history)  # 保存最终图表
-                cleanup()
-                return  # 退出训练
-
-    if rank == 0:
-        print('训练完成')
-        plot_metrics(history)
-    cleanup()
+    finally:
+        cleanup()
 
 def main():
     world_size = torch.cuda.device_count()
     if world_size > 1:
-        mp.spawn(train, args=(world_size,), nprocs=world_size, join=True)
+        try:
+            mp.spawn(train, args=(world_size,), nprocs=world_size, join=True)
+        except Exception as e:
+            print(f"分布式训练失败: {e}")
+            cleanup()
     else:
         train(0, 1)
 

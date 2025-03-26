@@ -1,140 +1,3 @@
-import os
-import sys
-import time
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torchvision import transforms, datasets
-from torchvision.models import resnext101_32x8d, ResNeXt101_32X8D_Weights
-from torchvision.models.feature_extraction import create_feature_extractor
-from torchvision.ops import FeaturePyramidNetwork
-from tqdm import tqdm
-import json
-import matplotlib.pyplot as plt
-from config import Config
-
-# 用于记录训练过程中的参数
-history = {
-    'train_loss': [],
-    'val_accuracy': []
-}
-
-def setup(rank, world_size):
-    """初始化分布式环境"""
-    master_addr = os.getenv('MASTER_ADDR', '127.0.0.1')  # 默认使用 127.0.0.1
-    master_port = os.getenv('MASTER_PORT', '29500')      # 默认端口
-    os.environ['MASTER_ADDR'] = master_addr
-    os.environ['MASTER_PORT'] = master_port
-    try:
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    except RuntimeError as e:
-        print(f"分布式初始化失败: {e}")
-        raise
-
-def cleanup():
-    """清理分布式环境"""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-def get_transform(phase):
-    """根据配置生成数据变换"""
-    cfg = Config.data_transform[phase]
-    transforms_list = []
-    
-    if "RandomResizedCrop" in cfg:
-        transforms_list.append(transforms.RandomResizedCrop(cfg["RandomResizedCrop"]))
-    if "RandomHorizontalFlip" in cfg and cfg["RandomHorizontalFlip"]:
-        transforms_list.append(transforms.RandomHorizontalFlip())
-    if "Resize" in cfg:
-        transforms_list.append(transforms.Resize(cfg["Resize"]))
-    if "CenterCrop" in cfg:
-        transforms_list.append(transforms.CenterCrop(cfg["CenterCrop"]))
-    
-    transforms_list.append(transforms.ToTensor())
-    transforms_list.append(transforms.Normalize(mean=cfg["Normalize"]["mean"], 
-                                              std=cfg["Normalize"]["std"]))
-    
-    return transforms.Compose(transforms_list)
-
-def plot_metrics(history, save_dir='./plots'):
-    """绘制训练过程中的参数变化并保存"""
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(history['train_loss'], label='Training Loss')
-    plt.title('Training Loss Over Time')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, 'train_loss.png'))
-    plt.close()
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(history['val_accuracy'], label='Validation Accuracy')
-    plt.title('Validation Accuracy Over Time')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, 'val_accuracy.png'))
-    plt.close()
-
-class ResNeXtWithFPN(nn.Module):
-    def __init__(self, num_classes):
-        super(ResNeXtWithFPN, self).__init__()
-        
-        # 加载预训练的 ResNeXt101
-        base_model = resnext101_32x8d(weights=ResNeXt101_32X8D_Weights.IMAGENET1K_V1)
-        
-        # 定义特征提取层
-        self.feature_extractor = create_feature_extractor(
-            base_model,
-            return_nodes={
-                'layer1': 'layer1',
-                'layer2': 'layer2',
-                'layer3': 'layer3',
-                'layer4': 'layer4',
-            }
-        )
-        
-        # 定义 FPN
-        self.fpn = FeaturePyramidNetwork(
-            in_channels_list=[256, 512, 1024, 2048],  # ResNeXt 各层的输出通道数
-            out_channels=256  # FPN 统一输出通道数
-        )
-        
-        # 全局池化
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # 融合多层特征的全连接层
-        self.fc = nn.Linear(256 * 4, num_classes)  # 融合 4 层特征，每层 256 通道
-        
-    def forward(self, x):
-        # 提取多层特征
-        features = self.feature_extractor(x)
-        
-        # 将特征送入 FPN
-        fpn_features = self.fpn(features)
-        
-        # 融合所有层的特征
-        pooled_features = []
-        for layer_name in ['layer1', 'layer2', 'layer3', 'layer4']:
-            pooled = self.pool(fpn_features[layer_name])
-            pooled = pooled.view(pooled.size(0), -1)
-            pooled_features.append(pooled)
-        
-        # 拼接所有特征
-        combined_features = torch.cat(pooled_features, dim=1)  # [batch_size, 256*4]
-        
-        # 分类
-        x = self.fc(combined_features)
-        return x
-
 def train(rank, world_size):
     """训练函数"""
     setup(rank, world_size)
@@ -143,7 +6,7 @@ def train(rank, world_size):
     if rank == 0:
         print(f"使用 {world_size} 个GPU进行训练。")
 
-    # 数据加载
+    # 数据加载部分保持不变
     train_dataset = datasets.ImageFolder(
         root=os.path.join(Config.dataset["root"], Config.dataset["train_dir"]),
         transform=get_transform("train")
@@ -185,7 +48,7 @@ def train(rank, world_size):
     # 模型加载
     model = ResNeXtWithFPN(num_classes=Config.dataset["num_classes"])
     model = model.to(device)
-    model = DDP(model, device_ids=[rank], find_unused_parameters=True)  # 启用未使用参数检测
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     # 损失函数和优化器
     loss_function = nn.CrossEntropyLoss()
@@ -263,6 +126,7 @@ def train(rank, world_size):
                 history['train_loss'].append(train_loss)
                 history['val_accuracy'].append(val_accurate)
 
+                # 保存最佳模型到 Config.save_path
                 if val_accurate > best_acc:
                     best_acc = val_accurate
                     checkpoint = {
@@ -273,7 +137,18 @@ def train(rank, world_size):
                         'best_acc': best_acc
                     }
                     torch.save(checkpoint, Config.save_path)
-                    print(f"新的最佳准确率: {best_acc:.3f}，模型已保存。")
+                    print(f"新的最佳准确率: {best_acc:.3f}，模型已保存至 {Config.save_path}")
+
+                # 新增：保存当前epoch的模型到 latest.pth
+                latest_checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'epoch': epoch,
+                    'best_acc': best_acc
+                }
+                torch.save(latest_checkpoint, 'latest.pth')
+                print(f"当前模型已保存至 latest.pth")
 
                 # 绘制图表
                 plot_metrics(history)
@@ -283,25 +158,13 @@ def train(rank, world_size):
                 if elapsed_time > max_duration:
                     print(f"训练时间超过5小时（已用时 {elapsed_time/3600:.2f} 小时），退出训练。")
                     print(f"当前最佳准确率: {best_acc:.3f}，已保存至 {Config.save_path}")
+                    print(f"最后一个epoch模型已保存至 latest.pth")
                     plot_metrics(history)  # 保存最终图表
                     return  # 退出训练
 
         if rank == 0:
             print('训练完成')
+            print(f"最后一个epoch模型已保存至 latest.pth")
             plot_metrics(history)
     finally:
         cleanup()
-
-def main():
-    world_size = torch.cuda.device_count()
-    if world_size > 1:
-        try:
-            mp.spawn(train, args=(world_size,), nprocs=world_size, join=True)
-        except Exception as e:
-            print(f"分布式训练失败: {e}")
-            cleanup()
-    else:
-        train(0, 1)
-
-if __name__ == '__main__':
-    main()

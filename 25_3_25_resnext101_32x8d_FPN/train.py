@@ -16,10 +16,13 @@ import json
 import matplotlib.pyplot as plt
 from config import Config
 
-# 用于记录训练过程中的参数
+# 用于记录训练过程中的参数（扩展）
 history = {
     'train_loss': [],
-    'val_accuracy': []
+    'train_accuracy': [],  # 新增：训练准确率
+    'val_loss': [],        # 新增：验证损失
+    'val_accuracy': [],
+    'learning_rate': []    # 新增：学习率
 }
 
 def setup(rank, world_size):
@@ -60,28 +63,43 @@ def get_transform(phase):
     return transforms.Compose(transforms_list)
 
 def plot_metrics(history, save_dir='./plots'):
-    """绘制训练过程中的参数变化并保存"""
+    """绘制训练过程中的参数变化并保存（扩展）"""
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
+    # 绘制训练和验证损失
     plt.figure(figsize=(10, 6))
     plt.plot(history['train_loss'], label='Training Loss')
-    plt.title('Training Loss Over Time')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Training and Validation Loss Over Time')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(save_dir, 'train_loss.png'))
+    plt.savefig(os.path.join(save_dir, 'loss.png'))
     plt.close()
     
+    # 绘制训练和验证准确率
     plt.figure(figsize=(10, 6))
+    plt.plot(history['train_accuracy'], label='Training Accuracy')
     plt.plot(history['val_accuracy'], label='Validation Accuracy')
-    plt.title('Validation Accuracy Over Time')
+    plt.title('Training and Validation Accuracy Over Time')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(save_dir, 'val_accuracy.png'))
+    plt.savefig(os.path.join(save_dir, 'accuracy.png'))
+    plt.close()
+    
+    # 绘制学习率
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['learning_rate'], label='Learning Rate')
+    plt.title('Learning Rate Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'learning_rate.png'))
     plt.close()
 
 class ResNeXtWithFPN(nn.Module):
@@ -185,7 +203,7 @@ def train(rank, world_size):
     # 模型加载
     model = ResNeXtWithFPN(num_classes=Config.dataset["num_classes"])
     model = model.to(device)
-    model = DDP(model, device_ids=[rank], find_unused_parameters=True)  # 启用未使用参数检测
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     # 损失函数和优化器
     loss_function = nn.CrossEntropyLoss()
@@ -221,8 +239,10 @@ def train(rank, world_size):
             model.train()
             train_sampler.set_epoch(epoch)
             running_loss = 0.0
-            train_bar = tqdm(train_loader, file=sys.stdout, disable=rank != 0)
+            train_correct = 0  # 新增：记录训练正确预测数
+            train_total = 0    # 新增：记录训练样本总数
             
+            train_bar = tqdm(train_loader, file=sys.stdout, disable=rank != 0)
             for data in train_bar:
                 images, labels = data
                 images, labels = images.to(device), labels.to(device)
@@ -237,13 +257,21 @@ def train(rank, world_size):
                 scaler.update()
 
                 running_loss += loss.item()
+                # 计算训练准确率
+                predict_y = torch.max(outputs, dim=1)[1]
+                train_correct += torch.eq(predict_y, labels).sum().item()
+                train_total += labels.size(0)
+                
                 train_bar.desc = f"训练 epoch[{epoch+1}/{Config.epochs}] 损失:{loss:.3f}"
 
             dist.barrier()
 
             if rank == 0:
                 model.eval()
-                acc = 0.0
+                val_loss = 0.0     # 新增：验证损失
+                val_correct = 0    # 新增：验证正确预测数
+                val_total = 0      # 新增：验证样本总数
+                
                 with torch.no_grad():
                     val_bar = tqdm(validate_loader, file=sys.stdout)
                     for val_data in val_bar:
@@ -251,21 +279,35 @@ def train(rank, world_size):
                         val_images, val_labels = val_images.to(device), val_labels.to(device)
                         with torch.amp.autocast('cuda'):
                             outputs = model(val_images)
+                            loss = loss_function(outputs, val_labels)
+                        val_loss += loss.item()
                         predict_y = torch.max(outputs, dim=1)[1]
-                        acc += torch.eq(predict_y, val_labels).sum().item()
+                        val_correct += torch.eq(predict_y, val_labels).sum().item()
+                        val_total += val_labels.size(0)
                         val_bar.desc = f"验证 epoch[{epoch+1}/{Config.epochs}]"
 
-                val_accurate = acc / len(validate_dataset)
+                # 计算指标
                 train_loss = running_loss / len(train_loader)
-                print(f'[epoch {epoch+1}] 训练损失: {train_loss:.3f} 验证准确率: {val_accurate:.3f}')
+                train_accuracy = train_correct / train_total
+                val_loss = val_loss / len(validate_loader)
+                val_accuracy = val_correct / val_total
+                
+                # 获取当前学习率
+                current_lr = optimizer.param_groups[0]['lr']
+                
+                print(f'[epoch {epoch+1}] 训练损失: {train_loss:.3f} 训练准确率: {train_accuracy:.3f}')
+                print(f'验证损失: {val_loss:.3f} 验证准确率: {val_accuracy:.3f} 学习率: {current_lr:.6f}')
 
                 # 记录训练过程中的参数
                 history['train_loss'].append(train_loss)
-                history['val_accuracy'].append(val_accurate)
+                history['train_accuracy'].append(train_accuracy)
+                history['val_loss'].append(val_loss)
+                history['val_accuracy'].append(val_accuracy)
+                history['learning_rate'].append(current_lr)
 
                 # 保存最佳模型到 Config.save_path
-                if val_accurate > best_acc:
-                    best_acc = val_accurate
+                if val_accuracy > best_acc:
+                    best_acc = val_accuracy
                     checkpoint = {
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
@@ -276,7 +318,7 @@ def train(rank, world_size):
                     torch.save(checkpoint, Config.save_path)
                     print(f"新的最佳准确率: {best_acc:.3f}，模型已保存至 {Config.save_path}")
 
-                # 新增：保存当前epoch的模型到 latest.pth
+                # 保存当前epoch的模型到 latest.pth
                 latest_checkpoint = {
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -296,8 +338,8 @@ def train(rank, world_size):
                     print(f"训练时间超过5小时（已用时 {elapsed_time/3600:.2f} 小时），退出训练。")
                     print(f"当前最佳准确率: {best_acc:.3f}，已保存至 {Config.save_path}")
                     print(f"最后一个epoch模型已保存至 latest.pth")
-                    plot_metrics(history)  # 保存最终图表
-                    return  # 退出训练
+                    plot_metrics(history)
+                    return
 
         if rank == 0:
             print('训练完成')
